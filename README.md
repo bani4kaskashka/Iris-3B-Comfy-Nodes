@@ -54,28 +54,24 @@ All three text-to-image workflows end with a 4x upscale group (1024 to 4096) tha
 
 ## Models
 
-When a workflow opens with a model missing, ComfyUI lists it under Missing Models with a Download button. The loaders also download anything still missing on first run, so you only fetch what your workflow uses (about 44 GB for everything), so the workflows run as-is either way.
+When a workflow opens with an Iris model missing, ComfyUI lists it under Missing Models with a Download button. The Iris, upscaler, depth and Turbo LoRA loaders also download their own files on first run. The text encoder is not downloaded. Pick a Qwen3-VL-4B file you already have.
 
 ```
 models/diffusion_models/iris-3b.safetensors            text to image (12 GB)
 models/diffusion_models/iris-3b-upscaler.safetensors   4x upscaler (12 GB)
 models/diffusion_models/iris-3b-depth.safetensors      depth (12 GB)
-models/text_encoders/Qwen3-VL-4B-Instruct/             text encoder, the whole HF repo (8.3 GB)
+models/text_encoders/qwen3vl_4b_fp8_scaled.safetensors text encoder, any Qwen3-VL-4B file
 models/loras/iris-3b-turbo-r2-1000.safetensors         Turbo LoRA, only for the Turbo workflow (460 MB)
 ```
 
-To get them yourself, the three Iris files are `model.safetensors`, `upscaler/model.safetensors` and `depth/model.safetensors` from [speridlabs/iris-3b](https://huggingface.co/speridlabs/iris-3b), renamed as above. The configs come with this pack.
+To get them yourself, the three Iris files are `model.safetensors`, `upscaler/model.safetensors` and `depth/model.safetensors` from [speridlabs/iris-3b](https://huggingface.co/speridlabs/iris-3b), renamed as above. The configs come with this pack. A checkpoint in the `iris-rowwise-int8-v1` layout (`qweight` plus a per-row `scale`, for example `Iris-3b-int8.safetensors`) is expanded to the selected weight dtype on load. Other quantized layouts are rejected.
 
-```
-hf download Qwen/Qwen3-VL-4B-Instruct --local-dir models/text_encoders/Qwen3-VL-4B-Instruct
-```
-
-The text encoder has to be the original HF folder. Single-file or fp8 Qwen3-VL text encoders won't work, because Iris reads 12 hidden layers from it.
+The text encoder is a single Qwen3-VL-4B file in `models/text_encoders`, the same kind of file other workflows use. fp8, nvfp4 and int8 are fine. Iris reads 12 hidden layers out of that file. It does not download the Qwen Hugging Face folder. `qwen_3_4b` (the Z-Image / Qwen3-4B encoder) is a different model and will be rejected.
 
 ## Nodes
 
 - **Load Iris-3B Model**: loads the DiT. `bf16` uses 6 GB of VRAM. `fp32` is the shipped precision but needs a lot more than 16 GB.
-- **Load Iris Text Encoder (Qwen3-VL-4B)**: lists HF folders in `text_encoders`.
+- **Load Iris Text Encoder (Qwen3-VL-4B)**: lists files in `text_encoders`. Pick a Qwen3-VL-4B file.
 - **Iris Text Encode**: positive and negative prompt. Leave the negative empty to use the null prompt the model was trained with.
 - **Iris Sampler (Simple)**: mode (text to image or image to image), resolution (1 MP sizes from 21:9 to 9:21, or match the input image), quality (fast = 30 steps, balanced = 50, best = 100), prompt adherence (cfg 2, 3 or 4.5), image strength (denoise 0.3, 0.5 or 0.7), seed and batch size.
 - **Iris Sampler (Advanced)**: every setting: steps, cfg, seed, batch size, mode, denoise, shift, solver order, CFG interval, any width/height in multiples of 16, and keep_model_on_gpu.

@@ -71,7 +71,7 @@
         "Node name for S&R": "IrisTextEncoderLoader"
       },
       "widgets_values": [
-        "Qwen3-VL-4B-Instruct"
+        "qwen3vl_4b_fp8_scaled.safetensors"
       ]
     },
     {

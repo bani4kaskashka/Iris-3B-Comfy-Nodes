@@ -1,9 +1,9 @@
 """ComfyUI nodes for Iris-3B (speridlabs/iris-3b), a pixel-space text-to-image DiT.
 
 Iris has no VAE: the sampler denoises RGB pixels directly and returns an IMAGE.
-Its text encoder is the language stack of Qwen3-VL-4B-Instruct (12 hidden layers
-are stacked), so it needs the original Hugging Face folder rather than a
-ComfyUI single-file text encoder. The 4x upscaler is Iris fine-tuned for
+Its text encoder is the language stack of Qwen3-VL-4B (12 hidden layers are
+stacked). Point the loader at a single file in models/text_encoders, the same
+way other workflows pick a CLIP. The 4x upscaler is Iris fine-tuned for
 restoration: one forward pass per 1024 px tile, conditioned on a stored empty
 prompt, so it needs no text encoder.
 
@@ -16,7 +16,7 @@ Default files, downloaded from the Hub on first use when missing:
     models/diffusion_models/iris-3b.safetensors            text to image
     models/diffusion_models/iris-3b-upscaler.safetensors   4x upscaler
     models/diffusion_models/iris-3b-depth.safetensors      monocular depth
-    models/text_encoders/Qwen3-VL-4B-Instruct/             whole HF repo
+    models/text_encoders/<Qwen3-VL-4B file>                one text encoder file
     models/loras/iris-3b-turbo-r2-1000.safetensors         4-step Turbo LoRA (optional)
 
 The configs come with this pack; the upscaler's and depth model's empty-prompt
@@ -25,14 +25,12 @@ Hub-layout folder (model.safetensors next to config.yaml) also works.
 """
 
 import copy
-import dataclasses
 import gc
 import json
 import logging
 import os
 import shutil
 from contextlib import contextmanager
-from pathlib import Path
 
 import torch
 from omegaconf import OmegaConf
@@ -48,7 +46,8 @@ from bucky_iris3b.flow.schedule import shift_sigma
 from bucky_iris3b.flow.solver import FlowDPMSolver
 from bucky_iris3b.models.dit import IrisDiT
 from bucky_iris3b.text.base import TextEncoding
-from bucky_iris3b.text.qwen3_vl import Qwen3VLTextEncoder
+
+from .text_encoder import load_file_encoder
 
 log = logging.getLogger("ComfyUI-Iris3B")
 
@@ -58,8 +57,6 @@ NULL_CACHE_DIR = os.path.join(HERE, "cache")
 GB = 1024**3
 
 IRIS_REPO = "speridlabs/iris-3b"
-TEXT_ENCODER_REPO = "Qwen/Qwen3-VL-4B-Instruct"
-TEXT_ENCODER_DIR = "Qwen3-VL-4B-Instruct"
 HF = "https://huggingface.co"
 
 # default file name -> (Hub file, bundled config)
@@ -134,30 +131,65 @@ def _config_path(weights: str, fallback: str) -> str:
     return os.path.join(CONFIGS, fallback)
 
 
-def _text_encoder_dir(name: str) -> str:
-    for root in folder_paths.get_folder_paths("text_encoders"):
-        path = os.path.join(root, name)
-        if os.path.isfile(os.path.join(path, "config.json")) and os.path.isfile(
-            os.path.join(path, "model.safetensors.index.json")
-        ):
-            return path
-    if name != TEXT_ENCODER_DIR:
-        raise FileNotFoundError(
-            f"text encoder folder '{name}' not found in models/text_encoders. It must be the whole "
-            f"{TEXT_ENCODER_REPO} repo"
-        )
-    from huggingface_hub import snapshot_download
+# Per-row int8 used by Iris-3b-int8.safetensors. Each Linear is stored as
+# qweight int8 [out, in] and scale fp32 [out, 1]; the DiT is plain nn.Linear.
+ROWWISE_INT8 = "iris-rowwise-int8-v1"
 
-    target = os.path.join(folder_paths.get_folder_paths("text_encoders")[0], name)
-    log.info("downloading %s to %s (8.3 GB)", TEXT_ENCODER_REPO, target)
-    snapshot_download(TEXT_ENCODER_REPO, local_dir=target)
-    return target
+
+def _row_scale(qweight: torch.Tensor, scale: torch.Tensor) -> bool:
+    if qweight.ndim != 2 or qweight.dtype != torch.int8:
+        return False
+    if scale.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        return False
+    rows = qweight.shape[0]
+    return scale.shape == (rows, 1) or scale.shape == (rows,)
 
 
 def _load_weights(path: str, dtype: torch.dtype) -> dict[str, torch.Tensor]:
-    # cast tensor by tensor so an fp32 file never sits in RAM whole
+    # Cast tensor by tensor so an fp32 file never sits in RAM whole. A row-wise
+    # int8 file is expanded here (qweight * scale -> weight) and the packed
+    # tensors are dropped before the next layer is read.
     with safe_open(path, framework="pt", device="cpu") as f:
-        return {key: f.get_tensor(key).to(dtype) for key in f.keys()}
+        keys = list(f.keys())
+        packed = {key for key in keys if key.endswith(".qweight")}
+        if not packed:
+            return {key: f.get_tensor(key).to(dtype) for key in keys}
+
+        fmt = (f.metadata() or {}).get("format") or ""
+        if fmt and fmt != ROWWISE_INT8:
+            raise ValueError(
+                f"{os.path.basename(path)} is quantized as {fmt!r}. "
+                f"This loader only expands {ROWWISE_INT8} (int8 qweight times a per-row scale)."
+            )
+
+        present = set(keys)
+        weights: dict[str, torch.Tensor] = {}
+        for key in keys:
+            if key.endswith(".qweight"):
+                stem = key[: -len("qweight")]
+                scale_key = stem + "scale"
+                plain = stem + "weight"
+                if scale_key not in present:
+                    raise ValueError(f"{os.path.basename(path)} has {key} without {scale_key}")
+                if plain in present:
+                    raise ValueError(f"{os.path.basename(path)} has both {plain} and {key}")
+                qweight = f.get_tensor(key)
+                scale = f.get_tensor(scale_key)
+                if not _row_scale(qweight, scale):
+                    raise ValueError(
+                        f"{os.path.basename(path)} {key} is {tuple(qweight.shape)} {qweight.dtype}, "
+                        f"scale {tuple(scale.shape)} {scale.dtype}; expected int8 [out, in] and fp scale [out, 1]"
+                    )
+                weights[plain] = (qweight.float() * scale.float()).to(dtype)
+                del qweight, scale
+            elif key.endswith(".scale") and (key[: -len("scale")] + "qweight") in packed:
+                continue
+            else:
+                weights[key] = f.get_tensor(key).to(dtype)
+        name = os.path.basename(path)
+        label = fmt or "row-wise int8"
+        log.info("expanded %s (%s) to %s Linear weights", name, label, dtype)
+        return weights
 
 
 def _build_dit(weights_path: str, config_path: str, dtype: torch.dtype) -> tuple[IrisDiT, object, dict | None]:
@@ -253,9 +285,9 @@ def _live_lora(model: "IrisModel", device):
 
 
 class IrisTextEncoder:
-    def __init__(self, encoder: Qwen3VLTextEncoder):
+    def __init__(self, encoder):
         self.encoder = encoder
-        self.nbytes = _nbytes(encoder.decoder)
+        self.nbytes = encoder.nbytes
 
 
 class IrisModelLoader:
@@ -288,21 +320,29 @@ class IrisModelLoader:
         return (IrisModel(model, cfg, DTYPES[weight_dtype], model_name),)
 
 
+def _text_encoder_files() -> list[str]:
+    """Qwen3-VL-4B files first, then every other text encoder, same list as a CLIP loader."""
+    names = folder_paths.get_filename_list("text_encoders")
+
+    def rank(name: str) -> tuple:
+        low = name.lower()
+        if "qwen3vl" in low or "qwen3-vl" in low or "qwen3_vl" in low:
+            return (0 if "4b" in low else 1, low)
+        return (2, low)
+
+    return sorted(names, key=rank)
+
+
 class IrisTextEncoderLoader:
     @classmethod
     def INPUT_TYPES(cls):
-        found = []
-        for root in folder_paths.get_folder_paths("text_encoders"):
-            if os.path.isdir(root):
-                found += [d for d in sorted(os.listdir(root))
-                          if d not in found and os.path.isfile(os.path.join(root, d, "config.json"))]
-        qwen = [d for d in found if "qwen3-vl-4b" in d.lower()]
-        names = [TEXT_ENCODER_DIR] + [d for d in qwen + found if d != TEXT_ENCODER_DIR]
+        names = _text_encoder_files() or ["(put a Qwen3-VL-4B file in models/text_encoders)"]
         return {
             "required": {
-                "encoder_folder": (list(dict.fromkeys(names)), {
-                    "tooltip": "Hugging Face folder of Qwen/Qwen3-VL-4B-Instruct in models/text_encoders. "
-                               "Downloaded on first use if missing (8.3 GB)",
+                "text_encoder": (names, {
+                    "tooltip": "A Qwen3-VL-4B file in models/text_encoders, such as "
+                               "qwen3vl_4b_fp8_scaled.safetensors or qwen3_vl_4b_nvfp4_full.safetensors. "
+                               "fp8, nvfp4 and int8 files are fine. Nothing is downloaded.",
                 }),
             }
         }
@@ -311,15 +351,15 @@ class IrisTextEncoderLoader:
     FUNCTION = "load"
     CATEGORY = "Iris-3B"
 
-    def load(self, encoder_folder):
-        path = _text_encoder_dir(encoder_folder)
-        raw = OmegaConf.to_container(OmegaConf.load(os.path.join(CONFIGS, STOCK[T2I_FILE][1])))
-        cfg = dataclasses.replace(inference_config(raw).text_encoder, pretrained=path, null_embed_dir=NULL_CACHE_DIR)
-        encoder = Qwen3VLTextEncoder(cfg, device="cpu")
-        # upstream names the null-embedding cache after cfg.pretrained, which is a
-        # full path here (on Windows its ':' would land in an NTFS stream); use the folder name
-        cache = Path(NULL_CACHE_DIR) / f"null_embed_{encoder_folder}_{cfg.max_length}.pth"
-        encoder._null_cache_path = lambda: cache
+    def load(self, text_encoder):
+        path = folder_paths.get_full_path("text_encoders", text_encoder)
+        if not path:
+            raise FileNotFoundError(
+                f"{text_encoder} is not a text encoder file in models/text_encoders. "
+                "Pick a Qwen3-VL-4B file. Iris does not download a Hugging Face folder."
+            )
+        encoder = load_file_encoder(path, NULL_CACHE_DIR)
+        log.info("loaded text encoder %s", text_encoder)
         return (IrisTextEncoder(encoder),)
 
 
